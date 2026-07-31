@@ -11,6 +11,7 @@ kankor.db-shm
 question_images/
 output_images/
 logs/
+app/
 
 # --- Internal docs (not published) ---
 kankor_quiz_bot_spec.md

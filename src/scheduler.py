@@ -31,6 +31,10 @@ TICK_SECONDS = 60
 # offered within seconds instead of waiting for the next tick.
 refill_now = asyncio.Event()
 
+# True once "slots are empty, nothing approved" has been reported, so that
+# warning is not repeated on every tick while the situation is unchanged.
+_ran_out_logged = False
+
 
 def _today_at(time_str, today=None):
     hh, mm = map(int, time_str.split(":"))
@@ -47,6 +51,32 @@ def post_times(cfg):
     if not times:
         raise ValueError("config.yaml is missing schedule.post_times")
     return times
+
+
+def unfilled_slot_count(conn, cfg):
+    """How many of today's posting slots still have no question in them."""
+    now = datetime.now()
+    return sum(
+        1 for post_time in post_times(cfg)
+        if not db.queue_slot_filled(conn, "daily", _iso(_today_at(post_time, now)))
+    )
+
+
+def approved_still_needed(conn, cfg):
+    """How many more approved questions today's schedule needs. Zero means the
+    day is covered and there is no reason to ask anyone to review more.
+
+    Counting approved-but-not-yet-queued questions alongside empty slots is what
+    makes this race-free: approving a question raises the approved count the
+    instant the button is tapped, so review stops immediately rather than a beat
+    later once the scheduler happens to run and consume it.
+
+    Posting a question immediately does not fill a slot and does not come from
+    the approved pool, so it leaves this number untouched — review keeps going
+    until a slot is genuinely filled.
+    """
+    approved = db.count_questions_by_status(conn).get("approved", 0)
+    return unfilled_slot_count(conn, cfg) - approved
 
 
 def build_todays_slots(conn, cfg):
@@ -80,12 +110,20 @@ def build_todays_slots(conn, cfg):
             f"(answer story at {(scheduled_dt + answer_delay).strftime('%H:%M')})",
         )
 
+    global _ran_out_logged
     if ran_out:
-        counts = db.count_questions_by_status(conn)
-        waiting = counts.get("pending_review", 0)
-        logger.warn(COMPONENT, "ran out of approved questions — some of today's slots are still empty")
-        logger.detail(COMPONENT, f"{waiting:,} questions are waiting for you to review in Telegram")
-        logger.detail(COMPONENT, "send /next to the review bot to approve more, and they'll fill in automatically")
+        # Said once per dry spell, not once a minute. Repeating an unchanged
+        # warning every tick buries the lines that report something new.
+        if not _ran_out_logged:
+            _ran_out_logged = True
+            counts = db.count_questions_by_status(conn)
+            waiting = counts.get("pending_review", 0)
+            empty = unfilled_slot_count(conn, cfg)
+            logger.warn(COMPONENT, f"{empty} of today's posting slots are still empty")
+            logger.detail(COMPONENT, f"{waiting:,} questions are waiting to be reviewed in Telegram")
+            logger.detail(COMPONENT, "approve some and they will fill these slots automatically")
+    else:
+        _ran_out_logged = False
 
     return filled
 

@@ -63,6 +63,10 @@ _sent_for_approval = set()
 # repeated every 20 seconds forever.
 _warned_unreachable = set()
 
+# True once "the day is covered, pausing review" has been said, so the pause is
+# announced once rather than every time the push loop comes round.
+_quiet_logged = False
+
 
 def _looks_unreachable(exc):
     """Telegram's way of saying "this person has never opened a chat with me"."""
@@ -70,8 +74,21 @@ def _looks_unreachable(exc):
     return "chat not found" in text or "bot can't initiate" in text or "blocked" in text
 
 
+def _looks_transient(exc):
+    """A slow or flaky connection, not something anyone needs to fix."""
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "network" in text or "connection" in text
+
+
 def _report_delivery_problem(admin_id, exc, what):
     """Explain a failed Telegram delivery in terms the reader can act on."""
+    if _looks_transient(exc):
+        # Uploading a card on a slow connection times out fairly often. It
+        # retries by itself within seconds, so reporting it as an error would
+        # train the reader to ignore the lines that do matter.
+        logger.warn(COMPONENT, f"the internet was slow sending {what} — retrying shortly")
+        return
+
     if _looks_unreachable(exc):
         if admin_id in _warned_unreachable:
             return
@@ -146,14 +163,29 @@ def _keyboard(qid):
     ])
 
 
-async def _broadcast_next_question(bot, conn, cfg):
+async def _broadcast_next_question(bot, conn, cfg, forced=False):
     """Show the next question to every reviewer at once.
 
-    Returns False when nothing was sent — either a question is already open for
-    decision, or there is nothing left to review.
+    Returns False when nothing was sent, which happens for three reasons:
+      * a question is already open — nothing new goes out until it is decided,
+        so an undecided question is never re-sent and cannot flood the chat
+      * today's posts are all covered, so there is nothing to review for
+      * there is nothing left in the pool
+
+    forced=True is /next: ask anyway even though the day is already covered.
     """
+    global _quiet_logged
+
     if _review["qid"] is not None:
         return False  # one already open; deciding it releases the next
+
+    if not forced and scheduler.approved_still_needed(conn, cfg) <= 0:
+        if not _quiet_logged:
+            _quiet_logged = True
+            logger.ok(COMPONENT, "today's posts are all covered — pausing question review")
+            logger.detail(COMPONENT, "no more questions will be sent until a slot opens up or a new day starts")
+            logger.detail(COMPONENT, "send /next in Telegram if you want to review more anyway")
+        return False
 
     question = db.claim_next_pending_review(conn, 0)
     if question is None:
@@ -197,6 +229,7 @@ async def _broadcast_next_question(bot, conn, cfg):
 
     _review["qid"] = question["id"]
     _review["cards"] = cards
+    _quiet_logged = False
     return True
 
 
@@ -286,12 +319,13 @@ async def cmd_next(update, context):
         return
     conn = context.bot_data["conn"]
     async with _decision_lock:
-        sent = await _broadcast_next_question(context.bot, conn, cfg)
+        # forced: /next means "give me one anyway", even when the day is covered.
+        sent = await _broadcast_next_question(context.bot, conn, cfg, forced=True)
     if not sent:
         if _review["qid"] is not None:
             await update.message.reply_text("There is already a question waiting for a decision above.")
         else:
-            await update.message.reply_text("No questions waiting for review right now.")
+            await update.message.reply_text("No questions left to review.")
 
 
 async def cmd_status(update, context):
@@ -300,6 +334,10 @@ async def cmd_status(update, context):
         return
     conn = context.bot_data["conn"]
     q = db.count_questions_by_status(conn)
+    times = scheduler.post_times(cfg)
+    empty = scheduler.unfilled_slot_count(conn, cfg)
+    needed = scheduler.approved_still_needed(conn, cfg)
+
     lines = [
         "📊 Where things stand",
         "",
@@ -309,8 +347,14 @@ async def cmd_status(update, context):
         f"Already posted          : {q.get('posted', 0):,}",
         f"Rejected                : {q.get('rejected', 0):,}",
         "",
-        f"Posts per day: {len(scheduler.post_times(cfg))} "
-        f"({', '.join(scheduler.post_times(cfg))})",
+        f"Today: {len(times) - empty} of {len(times)} posts filled",
+        f"Times: {', '.join(times)}",
+        "",
+        (
+            "✅ Today is fully covered — no more questions will be sent.\nUse /next if you want to review more anyway."
+            if needed <= 0
+            else f"Still need {needed} more approved question(s) to fill today."
+        ),
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -348,6 +392,20 @@ async def on_button(update, context):
             db.release_question(conn, qid)
             logger.info(COMPONENT, f"{who} skipped a question — it goes back in the queue")
             await _decide_question(context.bot, conn, cfg, f"⏭ Skipped by {who} (back in the queue)")
+
+        elif action == "postnow":
+            # Clear the buttons everywhere BEFORE the upload starts. Publishing
+            # takes several seconds, and leaving live buttons on every other
+            # reviewer's copy for that long invites a second tap on a question
+            # that is already on its way to Facebook.
+            cards = _review["cards"]
+            _review["qid"] = None
+            _review["cards"] = []
+            await _close_cards(context.bot, cards, f"🚀 Posting now, requested by {who}...")
+
+            verdict = await _post_immediately(conn, cfg, qid, who)
+            await _close_cards(context.bot, cards, verdict)
+            await _broadcast_next_question(context.bot, conn, cfg)
 
         elif action == "reject":
             # Recorded straight away. Waiting for a typed reason would hold up
@@ -578,7 +636,7 @@ async def run(conn, cfg, stop_event):
     app.add_handler(CommandHandler("next", cmd_next))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("noreason", cmd_noreason))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(approve|reject|skip):"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(approve|reject|skip|postnow):"))
     app.add_handler(CallbackQueryHandler(on_post_button, pattern=r"^post_(approve|reject):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 

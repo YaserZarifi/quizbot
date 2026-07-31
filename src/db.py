@@ -197,18 +197,45 @@ def claim_next_pending_review(conn, admin_id):
 
 
 def recover_interrupted_publishes(conn):
-    """Re-arm posts that were mid-publish when the app stopped.
+    """Clean up posts that were mid-publish when the app stopped.
 
     'publishing' is held only for the seconds a Facebook upload takes, purely so
     a second reviewer's tap cannot start the same upload twice. If the app dies
     inside that window the row would otherwise sit in a state nothing looks at,
     silently costing that slot its post.
+
+    The two kinds recover differently. A scheduled post goes back to 'pending'
+    for the scheduler to offer again. An instant post has no scheduler watching
+    it, so it is closed out and its question returned to the approved pool,
+    where it will be picked up by an ordinary slot.
+
+    Returns (rescheduled, returned_to_pool).
     """
-    cur = conn.execute(
-        "UPDATE post_queue SET status = 'pending' WHERE status = 'publishing'"
-    )
+    scheduled = conn.execute(
+        "UPDATE post_queue SET status = 'pending' WHERE status = 'publishing' AND kind != 'instant'"
+    ).rowcount
+
+    stalled = conn.execute(
+        "SELECT id, question_ids FROM post_queue WHERE status = 'publishing' AND kind = 'instant'"
+    ).fetchall()
+    for row in stalled:
+        conn.execute(
+            "UPDATE post_queue SET status = 'failed', last_error = ? WHERE id = ?",
+            ("the app stopped while publishing", row["id"]),
+        )
+        conn.execute(
+            "UPDATE post_queue SET status = 'cancelled', last_error = ? "
+            "WHERE parent_id = ? AND status = 'pending'",
+            ("its post never published", row["id"]),
+        )
+        for qid in json.loads(row["question_ids"]):
+            conn.execute(
+                "UPDATE questions SET status = 'approved' WHERE id = ? AND status = 'queued'",
+                (qid,),
+            )
+
     conn.commit()
-    return cur.rowcount
+    return scheduled, len(stalled)
 
 
 def release_all_in_review(conn):

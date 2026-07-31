@@ -105,9 +105,14 @@ async def run_app(stop_event, shared=None):
     if recovered:
         logger.info(COMPONENT, f"{recovered:,} questions were mid-review when the app last stopped — back in the queue")
 
-    requeued = db.recover_interrupted_publishes(conn)
+    requeued, returned = db.recover_interrupted_publishes(conn)
     if requeued:
         logger.info(COMPONENT, f"{requeued:,} posts were mid-publish when the app last stopped — queued again")
+    if returned:
+        logger.info(
+            COMPONENT,
+            f"{returned:,} post-now requests were interrupted — those questions are back in the approved pool",
+        )
 
     await render.ensure_chromium_installed()
 
