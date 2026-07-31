@@ -1,0 +1,7 @@
+telethon
+python-telegram-bot
+playwright
+Pillow
+requests
+PyYAML
+pyinstaller

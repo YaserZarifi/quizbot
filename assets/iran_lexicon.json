@@ -1,0 +1,12 @@
+{
+  "_note": "Starter list of Iranian-Farsi words/phrases that differ from Afghan Dari usage. Edit freely — this only sets lexicon_flag=1 for the review bot to show a warning, it never auto-replaces text.",
+  "flag_words": [
+    "دانش‌آموز",
+    "دانشگاه آزاد",
+    "کنکور سراسری",
+    "حد",
+    "استکان",
+    "خیابون",
+    "چی کار"
+  ]
+}

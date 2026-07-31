@@ -1,0 +1,38 @@
+# --- Secrets / credentials (NEVER commit) ---
+config.yaml
+*.session
+*.session-journal
+
+# --- Local data ---
+kankor.db
+kankor.db-journal
+kankor.db-wal
+kankor.db-shm
+question_images/
+output_images/
+logs/
+
+# --- Internal docs (not published) ---
+kankor_quiz_bot_spec.md
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# --- PyInstaller build output ---
+build/
+dist/
+*.spec
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

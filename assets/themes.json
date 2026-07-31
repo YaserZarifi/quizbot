@@ -1,0 +1,10 @@
+{
+  "ریاضی":    { "bg": "#EEEDFE", "accent": "#534AB7", "text_dark": "#26215C" },
+  "فزیک":     { "bg": "#E6F1FB", "accent": "#185FA5", "text_dark": "#042C53" },
+  "کیمیا":    { "bg": "#E1F5EE", "accent": "#0F6E56", "text_dark": "#04342C" },
+  "بیولوژی":  { "bg": "#EAF3DE", "accent": "#3B6D11", "text_dark": "#173404" },
+  "دینیات":   { "bg": "#FAEEDA", "accent": "#854F0B", "text_dark": "#412402" },
+  "ادبیات":   { "bg": "#FAECE7", "accent": "#993C1D", "text_dark": "#4A1B0C" },
+  "جغرافیه":  { "bg": "#FBEAF0", "accent": "#993556", "text_dark": "#4B1528" },
+  "عمومی":    { "bg": "#F1EFE8", "accent": "#5F5E5A", "text_dark": "#2C2C2A" }
+}

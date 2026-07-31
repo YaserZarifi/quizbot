@@ -1,0 +1,4 @@
+{
+  "_note": "Maps set_position ranges (from '[57/60]' style markers) to subject. NOT confirmed yet — needs review against real scraped data (see spec §11.1). Leave empty ([]) until confirmed; subject_tagger.py falls back to keyword matching, then 'عمومی', so ingestion is never blocked by this being empty.",
+  "ranges": []
+}
