@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS questions (
     lexicon_flag    INTEGER DEFAULT 0,
     status          TEXT DEFAULT 'raw',
     claimed_by      INTEGER,
+    queue_order     INTEGER,
     reject_reason   TEXT,
     created_at      TEXT,
     reviewed_at     TEXT,
@@ -105,7 +106,7 @@ def connect(db_path):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
-    _ensure_columns(conn, "questions", {"claimed_by": "INTEGER"})
+    _ensure_columns(conn, "questions", {"claimed_by": "INTEGER", "queue_order": "INTEGER"})
     _ensure_columns(conn, "post_queue", {"parent_id": "INTEGER"})
     conn.commit()
     return conn
@@ -311,13 +312,15 @@ def claim_next_approved_question(conn):
     so without it every slot would look up "oldest approved" and get the same
     row back. Returns None when nothing is approved yet.
     """
-    # Ordered by when it was approved, not by id. Returning a question to the
-    # pool stamps it with a fresh time, which sends it to the back — otherwise
-    # a question removed from a slot would have the lowest id in the pool and
-    # would win that same slot straight back, forever.
+    # queue_order, not id, decides who is next. A question taken back out of the
+    # queue is stamped with a number higher than every other, sending it to the
+    # back; without that it would still have the lowest id in the pool and would
+    # immediately win back the very slot it was just removed from.
+    # Timestamps were tried first and are not safe here: several questions
+    # approved inside the same second tie, and the tie-break falls back to id.
     row = conn.execute(
         "SELECT * FROM questions WHERE status = 'approved' "
-        "ORDER BY COALESCE(reviewed_at, '') , id LIMIT 1"
+        "ORDER BY COALESCE(queue_order, 0), id LIMIT 1"
     ).fetchone()
     if row is None:
         return None
@@ -337,15 +340,17 @@ def unqueue_questions(conn, question_ids, status):
     """Send queued questions back out of the queue — 'approved' to try again
     later, 'rejected' to retire them.
 
-    Going back to 'approved' re-stamps reviewed_at so the question joins the
-    back of the pool (see claim_next_approved_question) instead of instantly
-    reclaiming the slot it was just taken out of.
+    Going back to 'approved' sends the question to the back of the pool (see
+    claim_next_approved_question) instead of instantly reclaiming the slot it
+    was just taken out of.
     """
     for qid in question_ids:
         if status == "approved":
             conn.execute(
-                "UPDATE questions SET status = ?, reviewed_at = ? WHERE id = ? AND status = 'queued'",
-                (status, _now(), qid),
+                "UPDATE questions SET status = ?, queue_order = "
+                "(SELECT COALESCE(MAX(queue_order), 0) + 1 FROM questions) "
+                "WHERE id = ? AND status = 'queued'",
+                (status, qid),
             )
         else:
             conn.execute(

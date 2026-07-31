@@ -24,7 +24,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -369,12 +369,26 @@ async def cmd_start(update, context):
     cfg = context.bot_data["cfg"]
     if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
         return
+    conn = context.bot_data["conn"]
+    times = scheduler.post_times(cfg, conn)
     await update.message.reply_text(
-        "Kankor bot is running.\n\n"
-        "Questions arrive here automatically for you to approve or reject.\n"
-        "Every reviewer sees the same question — whoever answers first decides it.\n\n"
+        "🤖 Kankor bot is running.\n\n"
+        "Questions arrive here on their own for you to approve or reject. Every "
+        "reviewer sees the same question, and whoever answers first decides it.\n\n"
+        "On each question:\n"
+        "✅ Approve — put it in the queue for a scheduled slot\n"
+        "❌ Reject — never post it\n"
+        "⏭ Skip — decide later\n"
+        "🚀 Post now — put it on Facebook immediately, outside the schedule\n\n"
+        "Commands:\n"
         "/next — show the next question now\n"
-        "/status — how many questions are waiting, approved and posted"
+        "/status — what is waiting, approved and posted\n"
+        "/queue — today's scheduled posts, numbered\n"
+        "/slots — change how many posts go out per day\n"
+        "/remove <number> — drop one post from the queue\n"
+        "/wipe — clear today's whole queue\n\n"
+        f"Right now: {len(times)} posts a day at {', '.join(times)}.\n"
+        f"Each answer story follows {cfg['schedule']['answer_delay_hours']} hours after its question."
     )
 
 
@@ -518,6 +532,246 @@ async def on_text(update, context):
     _pending_reason["qid"] = None
     _pending_reason["admin_id"] = None
     await update.message.reply_text("Reason saved.")
+
+
+# ---- managing the queue ---------------------------------------------------
+
+def _today_prefix():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _queue_lines(conn, cfg):
+    """Today's schedule as numbered lines, so /remove can refer to a number."""
+    entries = db.todays_schedule(conn, _today_prefix())
+    times = scheduler.post_times(cfg, conn)
+    lines = [f"🗓 Today's queue — {len(entries)} of {len(times)} slots filled", ""]
+
+    if not entries:
+        lines.append("Nothing scheduled yet.")
+    else:
+        labels = {
+            "pending": "waiting for its time",
+            "awaiting_approval": "waiting for you to publish",
+            "publishing": "publishing now",
+            "done": "already posted",
+            "failed": "failed",
+        }
+        for i, entry in enumerate(entries, start=1):
+            qids = json.loads(entry["question_ids"])
+            questions = db.get_questions_by_ids(conn, qids)
+            name = questions[0]["public_id"] if questions else "?"
+            state = labels.get(entry["status"], entry["status"])
+            lines.append(f"{i}. {entry['scheduled_at'][11:16]}  {name}  — {state}")
+
+    empty = scheduler.unfilled_slot_count(conn, cfg)
+    if empty:
+        lines += ["", f"{empty} slot(s) still empty — approve more questions to fill them."]
+    return entries, "\n".join(lines)
+
+
+async def cmd_queue(update, context):
+    cfg = context.bot_data["cfg"]
+    if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
+        return
+    conn = context.bot_data["conn"]
+    _, text = _queue_lines(conn, cfg)
+    await update.message.reply_text(
+        text + "\n\n/remove <number> to drop one · /wipe to clear them all"
+    )
+
+
+async def cmd_slots(update, context):
+    """Change how many posts go out per day."""
+    cfg = context.bot_data["cfg"]
+    if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
+        return
+    conn = context.bot_data["conn"]
+    current = scheduler.post_times(cfg, conn)
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            f"📌 Posts per day: {len(current)}\n"
+            f"Times: {', '.join(current)}\n\n"
+            f"Change it with /slots <number> "
+            f"({scheduler.MIN_POSTS_PER_DAY}–{scheduler.MAX_POSTS_PER_DAY}).\n"
+            "The times spread evenly across the same part of the day.\n"
+            "/slots reset goes back to the times in config.yaml."
+        )
+        return
+
+    if args[0].lower() == "reset":
+        db.set_setting(conn, scheduler.POSTS_PER_DAY_SETTING, None)
+        times = scheduler.post_times(cfg, conn)
+        _apply_new_times(conn, times, "the number of posts a day changed")
+        scheduler.refill_now.set()
+        _wake_review()
+        logger.ok(COMPONENT, f"posts per day reset to {len(times)} ({', '.join(times)})")
+        await update.message.reply_text(f"Back to {len(times)} posts a day:\n{', '.join(times)}")
+        return
+
+    try:
+        count = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Give me a number, for example /slots 8")
+        return
+
+    if not scheduler.MIN_POSTS_PER_DAY <= count <= scheduler.MAX_POSTS_PER_DAY:
+        await update.message.reply_text(
+            f"Pick a number between {scheduler.MIN_POSTS_PER_DAY} and {scheduler.MAX_POSTS_PER_DAY}."
+        )
+        return
+
+    db.set_setting(conn, scheduler.POSTS_PER_DAY_SETTING, count)
+    times = scheduler.post_times(cfg, conn)
+    dropped = _apply_new_times(conn, times, "the number of posts a day changed")
+    scheduler.refill_now.set()
+    _wake_review()
+
+    logger.ok(COMPONENT, f"posts per day changed to {len(times)} ({', '.join(times)})")
+    note = f"\n\n{dropped} scheduled post(s) no longer matched a slot and went back in the pool." if dropped else ""
+    await update.message.reply_text(
+        f"✅ Now {len(times)} posts a day.\nTimes: {', '.join(times)}{note}\n\n"
+        "Empty slots fill up as you approve questions."
+    )
+
+
+def _apply_new_times(conn, times, reason):
+    """Retire today's scheduled posts that no longer land on a slot.
+
+    Changing the number of posts moves the times, so entries booked against the
+    old times would otherwise linger as extra posts nobody asked for.
+    """
+    wanted = {scheduler._iso(scheduler._today_at(t)) for t in times}
+    dropped = 0
+    for entry in db.todays_schedule(conn, _today_prefix()):
+        if entry["scheduled_at"] in wanted or entry["status"] in ("done", "publishing"):
+            continue
+        db.cancel_queue_entry(conn, entry["id"], reason)
+        db.unqueue_questions(conn, json.loads(entry["question_ids"]), "approved")
+        dropped += 1
+    return dropped
+
+
+async def cmd_remove(update, context):
+    """Drop one scheduled post; its slot refills with a different question."""
+    cfg = context.bot_data["cfg"]
+    if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
+        return
+    conn = context.bot_data["conn"]
+    entries, listing = _queue_lines(conn, cfg)
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(listing + "\n\nWhich one? Send /remove <number>")
+        return
+
+    try:
+        index = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Give me the number from /queue, for example /remove 2")
+        return
+
+    if not 1 <= index <= len(entries):
+        await update.message.reply_text(f"There is no item {index}. Send /queue to see the list.")
+        return
+
+    entry = entries[index - 1]
+    if entry["status"] in ("done", "publishing"):
+        await update.message.reply_text("That one has already gone out — it cannot be removed.")
+        return
+
+    qids = json.loads(entry["question_ids"])
+    questions = db.get_questions_by_ids(conn, qids)
+    name = questions[0]["public_id"] if questions else "?"
+    when = entry["scheduled_at"][11:16]
+
+    db.cancel_queue_entry(conn, entry["id"], "removed by a reviewer")
+    db.unqueue_questions(conn, qids, "approved")
+    _post_cards.pop(entry["id"], None)
+    _sent_for_approval.discard(entry["id"])
+    scheduler.refill_now.set()
+    _wake_review()
+
+    logger.info(COMPONENT, f"the {when} post (question {name}) was removed from the queue")
+    await update.message.reply_text(
+        f"🗑 Removed the {when} post ({name}).\n\n"
+        "That question goes to the back of the approved pool, and the slot will "
+        "be filled with a different one."
+    )
+
+
+async def cmd_wipe(update, context):
+    """Clear every scheduled post for today, after a confirmation."""
+    cfg = context.bot_data["cfg"]
+    if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
+        return
+    conn = context.bot_data["conn"]
+    entries, _ = _queue_lines(conn, cfg)
+    removable = [e for e in entries if e["status"] not in ("done", "publishing")]
+
+    if not removable:
+        await update.message.reply_text("There is nothing in today's queue to clear.")
+        return
+
+    await update.message.reply_text(
+        f"⚠️ Clear all {len(removable)} scheduled post(s) for today?\n\n"
+        "Their questions go back to the approved pool, and the empty slots will "
+        "be filled again with different questions.\n"
+        "Anything already posted is not affected.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, clear the queue", callback_data="wipe:yes"),
+            InlineKeyboardButton("Cancel", callback_data="wipe:no"),
+        ]]),
+    )
+
+
+async def on_wipe_button(update, context):
+    cfg = context.bot_data["cfg"]
+    if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
+        return
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if query.data.split(":")[1] != "yes":
+        await query.edit_message_text("Cancelled — the queue is unchanged.")
+        return
+
+    conn = context.bot_data["conn"]
+    who = update.effective_user.first_name or str(update.effective_user.id)
+    entries, _ = _queue_lines(conn, cfg)
+
+    cleared = 0
+    for entry in entries:
+        if entry["status"] in ("done", "publishing"):
+            continue
+        db.cancel_queue_entry(conn, entry["id"], f"queue cleared by {who}")
+        db.unqueue_questions(conn, json.loads(entry["question_ids"]), "approved")
+        _post_cards.pop(entry["id"], None)
+        _sent_for_approval.discard(entry["id"])
+        cleared += 1
+
+    scheduler.refill_now.set()
+    _wake_review()
+    logger.info(COMPONENT, f"{who} cleared today's queue — {cleared} scheduled post(s) removed")
+    await query.edit_message_text(
+        f"🧹 Cleared {cleared} scheduled post(s).\n\n"
+        "Their questions are back in the approved pool and the slots will refill "
+        "from the questions approved longest ago."
+    )
+
+
+def _wake_review():
+    """Let the review loop speak up again after the schedule changed."""
+    global _quiet_logged
+    _quiet_logged = False
 
 
 # ---- post approval --------------------------------------------------------
@@ -765,11 +1019,17 @@ async def run(conn, cfg, stop_event):
     app.bot_data["conn"] = conn
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("next", cmd_next))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("slots", cmd_slots))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("wipe", cmd_wipe))
     app.add_handler(CommandHandler("noreason", cmd_noreason))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(approve|reject|skip|postnow):"))
     app.add_handler(CallbackQueryHandler(on_post_button, pattern=r"^post_(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(on_wipe_button, pattern=r"^wipe:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     # Without this, a crash inside a button handler is swallowed by the library
     # and the app looks healthy while the buttons quietly stop working.
@@ -778,6 +1038,22 @@ async def run(conn, cfg, stop_event):
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+
+    # Puts the commands behind Telegram's "Menu" button with a one-line
+    # description each, so nobody has to remember them.
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("next", "Show the next question to review"),
+            BotCommand("status", "How many questions are waiting, approved and posted"),
+            BotCommand("queue", "See today's scheduled posts"),
+            BotCommand("slots", "Change how many posts go out per day"),
+            BotCommand("remove", "Remove one post from today's queue"),
+            BotCommand("wipe", "Clear today's whole queue"),
+            BotCommand("help", "What this bot can do"),
+        ])
+    except Exception as exc:
+        logger.warn(COMPONENT, "could not set up the Telegram menu — the commands still work by typing them")
+        logger.detail(COMPONENT, f"reason: {exc}")
 
     me = await app.bot.get_me()
     logger.ok(COMPONENT, f"review bot connected as @{me.username}")
