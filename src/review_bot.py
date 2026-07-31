@@ -107,6 +107,28 @@ def _report_delivery_problem(admin_id, exc, what):
     )
 
 
+def _reviewers(cfg):
+    """The reviewer ids, each exactly once, in the order they were configured.
+
+    A repeated id in config.yaml would otherwise mean that person is sent the
+    same question twice and gets two sets of buttons for one decision.
+    """
+    seen = set()
+    ordered = []
+    for admin_id in cfg["telegram"]["admin_user_ids"]:
+        if admin_id not in seen:
+            seen.add(admin_id)
+            ordered.append(admin_id)
+    return ordered
+
+
+def _reuse_id(message, fallback):
+    """Telegram's stored id for a photo just sent, so it is not re-uploaded."""
+    if message.photo:
+        return message.photo[-1].file_id
+    return fallback
+
+
 def _is_admin(update, admin_user_ids):
     user = update.effective_user
     if user is None or user.id not in admin_user_ids:
@@ -230,19 +252,24 @@ async def _broadcast_next_question(bot, conn, cfg, forced=False):
         return False
 
     with open(png_path, "rb") as f:
-        photo_bytes = f.read()
+        photo = f.read()
 
     caption = _caption_for(question)
     cards = []
-    for admin_id in cfg["telegram"]["admin_user_ids"]:
+    for admin_id in _reviewers(cfg):
         try:
             message = await bot.send_photo(
                 chat_id=admin_id,
-                photo=photo_bytes,
+                photo=photo,
                 caption=caption,
                 reply_markup=_keyboard(question["id"]),
             )
             cards.append((admin_id, message.message_id, caption))
+            # Hand Telegram's own id for the picture to the remaining reviewers
+            # instead of uploading the same bytes again. On a slow connection
+            # re-uploading per reviewer was most of the time spent here, and
+            # most of the reason sends timed out at all.
+            photo = _reuse_id(message, photo)
         except Exception as exc:
             _report_delivery_problem(admin_id, exc, "the next question")
 
@@ -255,6 +282,10 @@ async def _broadcast_next_question(bot, conn, cfg, forced=False):
     _review["qid"] = question["id"]
     _review["cards"] = cards
     _quiet_logged = False
+    logger.info(
+        COMPONENT,
+        f"question {question['public_id']} sent to {len(cards)} reviewer(s) — waiting for a decision",
+    )
     return True
 
 
@@ -368,7 +399,7 @@ async def cmd_status(update, context):
         return
     conn = context.bot_data["conn"]
     q = db.count_questions_by_status(conn)
-    times = scheduler.post_times(cfg)
+    times = scheduler.post_times(cfg, conn)
     empty = scheduler.unfilled_slot_count(conn, cfg)
     needed = scheduler.approved_still_needed(conn, cfg)
 
@@ -545,13 +576,18 @@ async def _send_post_for_approval(bot, cfg, conn, entry):
             images.append(f.read())
 
     cards = []
-    for admin_id in cfg["telegram"]["admin_user_ids"]:
+    for admin_id in _reviewers(cfg):
         try:
-            await bot.send_media_group(chat_id=admin_id, media=[InputMediaPhoto(img) for img in images])
+            sent = await bot.send_media_group(
+                chat_id=admin_id, media=[InputMediaPhoto(img) for img in images]
+            )
             message = await bot.send_message(
                 chat_id=admin_id, text=prompt, reply_markup=_post_keyboard(entry["id"])
             )
             cards.append((admin_id, message.message_id, prompt))
+            # Two full-size images per reviewer is the heaviest upload the app
+            # makes; swap to Telegram's ids so later reviewers cost nothing.
+            images = [_reuse_id(m, images[i]) for i, m in enumerate(sent)] or images
         except Exception as exc:
             _report_delivery_problem(admin_id, exc, f"the {scheduled_hhmm} post")
 
@@ -706,7 +742,25 @@ async def run(conn, cfg, stop_event):
     """
     token = cfg["telegram"]["review_bot_token"]
 
-    app = Application.builder().token(token).build()
+    # The library's defaults are a 5 second write timeout and a 1 second pool
+    # timeout, which a 1080x1080 PNG cannot meet on a slow connection. The
+    # upload would time out AFTER Telegram had already accepted and delivered
+    # it, so the app believed the send failed, put the question back, and sent
+    # the very same question again minutes later — and the copies it thought
+    # had failed kept their buttons forever because it never recorded them.
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(60)
+        .media_write_timeout(180)
+        .pool_timeout(30)
+        # Without this, one slow Facebook upload blocks every other button tap
+        # in the queue behind it, and those buttons look dead in the meantime.
+        .concurrent_updates(True)
+        .build()
+    )
     app.bot_data["cfg"] = cfg
     app.bot_data["conn"] = conn
 

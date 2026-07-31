@@ -46,18 +46,72 @@ def _iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
-def post_times(cfg):
+MIN_POSTS_PER_DAY = 1
+MAX_POSTS_PER_DAY = 12
+POSTS_PER_DAY_SETTING = "posts_per_day"
+
+
+def configured_times(cfg):
     times = cfg["schedule"].get("post_times")
     if not times:
         raise ValueError("config.yaml is missing schedule.post_times")
+    return list(times)
+
+
+def _to_minutes(hhmm):
+    hh, mm = map(int, hhmm.split(":"))
+    return hh * 60 + mm
+
+
+def _to_hhmm(minutes):
+    minutes = max(0, min(24 * 60 - 1, int(minutes)))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def spread_times(first, last, count):
+    """Spread `count` posts evenly between two times of day, rounded to 5 min.
+
+    Chosen so the default of 6 between 08:00 and 23:00 reproduces exactly the
+    times in config.yaml — changing the number of posts a day should not
+    silently move the ones already there.
+    """
+    if count <= 1:
+        return [first]
+    start, end = _to_minutes(first), _to_minutes(last)
+    step = (end - start) / (count - 1)
+    times = []
+    for i in range(count):
+        rounded = round((start + i * step) / 5) * 5
+        candidate = _to_hhmm(rounded)
+        if candidate not in times:
+            times.append(candidate)
     return times
+
+
+def post_times(cfg, conn=None):
+    """The times to post at today.
+
+    config.yaml holds the default list. Choosing a different number of posts
+    from Telegram stores an override in the database, and the times are then
+    spread across the same window the configured list covers.
+    """
+    times = configured_times(cfg)
+    if conn is None:
+        return times
+
+    override = db.get_int_setting(conn, POSTS_PER_DAY_SETTING)
+    if not override or override == len(times):
+        return times
+
+    override = max(MIN_POSTS_PER_DAY, min(MAX_POSTS_PER_DAY, override))
+    return spread_times(times[0], times[-1], override)
 
 
 def unfilled_slot_count(conn, cfg):
     """How many of today's posting slots still have no question in them."""
     now = datetime.now()
     return sum(
-        1 for post_time in post_times(cfg)
+        1 for post_time in post_times(cfg, conn)
         if not db.queue_slot_filled(conn, "daily", _iso(_today_at(post_time, now)))
     )
 
@@ -86,7 +140,7 @@ def build_todays_slots(conn, cfg):
     filled = 0
     ran_out = False
 
-    for post_time in post_times(cfg):
+    for post_time in post_times(cfg, conn):
         scheduled_dt = _today_at(post_time, now)
         scheduled_iso = _iso(scheduled_dt)
 
@@ -170,7 +224,8 @@ async def publish_due_answer_stories(conn, cfg):
 
 async def run(conn, cfg, stop_event):
     """The scheduling loop. Runs alongside the scraper and the review bot."""
-    logger.ok(COMPONENT, f"scheduler running — {len(post_times(cfg))} posts a day at {', '.join(post_times(cfg))}")
+    times = post_times(cfg, conn)
+    logger.ok(COMPONENT, f"scheduler running — {len(times)} posts a day at {', '.join(times)}")
 
     while not stop_event.is_set():
         try:

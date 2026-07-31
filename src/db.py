@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS source_state (
     updated_at            TEXT
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
 CREATE INDEX IF NOT EXISTS idx_questions_lang ON questions(lang);
 CREATE INDEX IF NOT EXISTS idx_post_queue_status ON post_queue(status, scheduled_at);
@@ -111,6 +116,36 @@ def _ensure_columns(conn, table, columns):
     for name, col_type in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+
+
+# ---- settings ------------------------------------------------------------
+# Choices made from Telegram that must outlive a restart. They live here rather
+# than in config.yaml so changing one never rewrites the file the user edits by
+# hand — a rewrite would strip every comment out of it.
+
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    if value is None:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+    conn.commit()
+
+
+def get_int_setting(conn, key, default=None):
+    raw = get_setting(conn, key)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---- source_state -----------------------------------------------------
@@ -276,8 +311,13 @@ def claim_next_approved_question(conn):
     so without it every slot would look up "oldest approved" and get the same
     row back. Returns None when nothing is approved yet.
     """
+    # Ordered by when it was approved, not by id. Returning a question to the
+    # pool stamps it with a fresh time, which sends it to the back — otherwise
+    # a question removed from a slot would have the lowest id in the pool and
+    # would win that same slot straight back, forever.
     row = conn.execute(
-        "SELECT * FROM questions WHERE status = 'approved' ORDER BY id LIMIT 1"
+        "SELECT * FROM questions WHERE status = 'approved' "
+        "ORDER BY COALESCE(reviewed_at, '') , id LIMIT 1"
     ).fetchone()
     if row is None:
         return None
@@ -295,12 +335,48 @@ def count_questions_by_status(conn):
 
 def unqueue_questions(conn, question_ids, status):
     """Send queued questions back out of the queue — 'approved' to try again
-    later, 'rejected' to retire them."""
+    later, 'rejected' to retire them.
+
+    Going back to 'approved' re-stamps reviewed_at so the question joins the
+    back of the pool (see claim_next_approved_question) instead of instantly
+    reclaiming the slot it was just taken out of.
+    """
     for qid in question_ids:
-        conn.execute(
-            "UPDATE questions SET status = ? WHERE id = ? AND status = 'queued'",
-            (status, qid),
-        )
+        if status == "approved":
+            conn.execute(
+                "UPDATE questions SET status = ?, reviewed_at = ? WHERE id = ? AND status = 'queued'",
+                (status, _now(), qid),
+            )
+        else:
+            conn.execute(
+                "UPDATE questions SET status = ? WHERE id = ? AND status = 'queued'",
+                (status, qid),
+            )
+    conn.commit()
+
+
+def todays_schedule(conn, day_prefix):
+    """Every scheduled post for one day, newest status first, for /queue."""
+    rows = conn.execute(
+        "SELECT * FROM post_queue WHERE kind = 'daily' AND scheduled_at LIKE ? "
+        "AND status NOT IN ('rejected', 'cancelled', 'skipped') "
+        "ORDER BY scheduled_at",
+        (day_prefix + "%",),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cancel_queue_entry(conn, entry_id, reason):
+    """Drop one scheduled post and its answer story, freeing its slot."""
+    conn.execute(
+        "UPDATE post_queue SET status = 'cancelled', last_error = ? WHERE id = ?",
+        (reason, entry_id),
+    )
+    conn.execute(
+        "UPDATE post_queue SET status = 'cancelled', last_error = ? "
+        "WHERE parent_id = ? AND status = 'pending'",
+        (reason, entry_id),
+    )
     conn.commit()
 
 
