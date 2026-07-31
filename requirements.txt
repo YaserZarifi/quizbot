@@ -2,6 +2,7 @@ telethon
 python-telegram-bot
 playwright
 Pillow
+pystray          # tray icon used when the bot runs in the background
 requests
 PyYAML
 pyinstaller

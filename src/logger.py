@@ -1,7 +1,13 @@
-"""Shared structured console logger. Every script prints through here so
-formatting stays identical everywhere (see kankor_quiz_bot_spec.md, §2.1).
+"""Shared console logger. Everything the app says goes through here so the
+window reads like a status report rather than programmer output.
 
-Console gets short, friendly lines only. Full tracebacks go to logs/error.log.
+Rules this module exists to enforce:
+  * Plain language. No tracebacks, no exception class names, no jargon on
+    screen — those go to logs/error.log, which is there for debugging.
+  * Every line says which part of the app is talking, in words ("Scraper",
+    "Facebook"), not module names.
+  * Errors always say what failed AND what happens next, so the reader is
+    never left wondering whether the app is stuck or recovering.
 """
 
 import logging
@@ -11,13 +17,33 @@ import sys
 import time
 import traceback
 
-_LEVEL_WIDTH = 5  # "ERROR" is the longest level label
-
 # Windows consoles default to a legacy codepage, so printing Persian/Pashto
 # question text would raise UnicodeEncodeError and kill the process.
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+        # line_buffering keeps progress visible when output is redirected to a file.
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+# Friendly names for the parts of the app, so the console never shows a
+# module name. Anything not listed here prints as-is.
+COMPONENT_NAMES = {
+    "main": "Startup",
+    "scheduler": "Scheduler",
+    "ingest": "Scraper",
+    "review": "Reviewer",
+    "publish": "Facebook",
+    "render": "Images",
+}
+
+_MARKERS = {
+    "info": "  ",
+    "ok": "OK",
+    "warn": "! ",
+    "error": "XX",
+    "setup": "..",
+}
+
+_NAME_WIDTH = 9  # "Scheduler" is the longest friendly name
 
 
 def _log_dir():
@@ -50,25 +76,77 @@ def _get_file_logger():
     return fl
 
 
-def _line(level, component, message):
+def _friendly(component):
+    return COMPONENT_NAMES.get(component, component)
+
+
+def activity_log_path():
+    return os.path.join(_log_dir(), "activity.log")
+
+
+_activity_file = None
+_activity_failed = False
+
+
+def _mirror(text):
+    """Append a line to activity.log.
+
+    When the app runs in the background it has no console at all, so this file
+    is the only record of what it is doing — and it is what the console window
+    reads back when you reopen it. A failure to write here must never take the
+    app down, so it is tried once and then left alone.
+    """
+    global _activity_file, _activity_failed
+    if _activity_failed:
+        return
+    try:
+        if _activity_file is None:
+            os.makedirs(_log_dir(), exist_ok=True)
+            _activity_file = open(activity_log_path(), "a", encoding="utf-8")
+        _activity_file.write(text + "\n")
+        _activity_file.flush()
+    except Exception:
+        _activity_failed = True
+
+
+def _emit(text):
+    print(text)
+    _mirror(text)
+
+
+def _line(marker, component, message):
     ts = time.strftime("%H:%M:%S")
-    print(f"{ts} [{level:<{_LEVEL_WIDTH}}] [{component}] {message}")
+    name = _friendly(component)
+    _emit(f"{ts}  {marker}  {name:<{_NAME_WIDTH}}  {message}")
 
 
 def info(component, message):
-    _line("INFO", component, message)
+    _line(_MARKERS["info"], component, message)
 
 
 def ok(component, message):
-    _line("OK", component, message)
+    _line(_MARKERS["ok"], component, message)
 
 
 def warn(component, message):
-    _line("WARN", component, message)
+    _line(_MARKERS["warn"], component, message)
 
 
 def setup(component, message):
-    _line("SETUP", component, message)
+    _line(_MARKERS["setup"], component, message)
+
+
+def detail(component, message):
+    """An indented follow-up line under whatever was just printed."""
+    _line("  ", component, f"    {message}")
+
+
+def section(title):
+    """A labelled divider, so long runs of output stay scannable."""
+    _emit("")
+    _emit(f"  {'-' * 66}")
+    _emit(f"  {title}")
+    _emit(f"  {'-' * 66}")
 
 
 def summary(component, title, rows):
@@ -81,18 +159,24 @@ def summary(component, title, rows):
         return
     label_width = max(len(label) for label, _ in rows)
     for label, value in rows:
-        ts = time.strftime("%H:%M:%S")
-        print(f"{ts} [{'OK':<{_LEVEL_WIDTH}}] [{component}]   {label:<{label_width}} : {value}")
+        detail(component, f"{label:<{label_width}} : {value}")
 
 
-def error(component, message, exc=None):
-    """Print a short friendly line to console; log full detail to error.log."""
-    _line("ERROR", component, message)
-    detail = message
+def error(component, message, exc=None, next_step=None):
+    """Short, plain-language line on screen; full technical detail to error.log.
+
+    next_step tells the reader what the app is doing about it — without that,
+    an error line reads as "everything stopped" even when it didn't.
+    """
+    _line(_MARKERS["error"], component, message)
+    if next_step:
+        detail(component, f"-> {next_step}")
+
+    written = message
     if exc is not None:
-        detail += "\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    _get_file_logger().error("[%s] %s", component, detail)
+        written += "\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    _get_file_logger().error("[%s] %s", component, written)
 
 
 def blank():
-    print()
+    _emit("")

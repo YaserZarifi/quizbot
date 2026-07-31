@@ -7,14 +7,24 @@ kankor.db from an earlier run keeps working without a real migration tool.
 
 questions.status flow:
     raw -> pending_review -> in_review (claimed by one admin via /next,
-    claimed_by set) -> approved / rejected -> posted
+    claimed_by set) -> approved -> queued -> posted, or rejected at any point
 Any admin in config.telegram.admin_user_ids may claim/approve/reject; skip
 releases a claimed row back to pending_review so it can be claimed again.
 
+'queued' is what stops one question filling every slot in the day: the
+scheduler claims a question the moment it builds a slot for it, so the next
+slot's lookup can't hand back the same row. It is not the same as 'posted' —
+a question sits in 'queued' from the moment its slot is created until Facebook
+actually accepts the post, which can be hours later.
+
 post_queue.status flow:
-    pending -> (main.py, once scheduled_at is due) -> awaiting_approval ->
-    (review_bot.py sends the actual rendered post + caption to Telegram;
-    an admin taps Publish or Reject) -> done / rejected
+    pending -> (scheduler, once scheduled_at is due) -> awaiting_approval ->
+    (review_bot.py sends the rendered post + caption to Telegram; an admin taps
+    Publish or Reject) -> done / rejected
+Answer-story rows skip approval entirely: they carry parent_id pointing at the
+post they answer, and auto-publish once due if — and only if — that parent
+reached 'done'. Rejecting a post therefore cancels its answer story too.
+
 A failed Facebook call drops a row back to pending for the next tick to
 retry (bumping attempts); more than 4 hours late gets skipped instead of
 ever reaching Telegram.
@@ -66,7 +76,8 @@ CREATE TABLE IF NOT EXISTS post_queue (
     scheduled_at    TEXT,
     status          TEXT DEFAULT 'pending',
     attempts        INTEGER DEFAULT 0,
-    last_error      TEXT
+    last_error      TEXT,
+    parent_id       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS source_state (
@@ -90,6 +101,7 @@ def connect(db_path):
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     _ensure_columns(conn, "questions", {"claimed_by": "INTEGER"})
+    _ensure_columns(conn, "post_queue", {"parent_id": "INTEGER"})
     conn.commit()
     return conn
 
@@ -184,6 +196,35 @@ def claim_next_pending_review(conn, admin_id):
     return question
 
 
+def recover_interrupted_publishes(conn):
+    """Re-arm posts that were mid-publish when the app stopped.
+
+    'publishing' is held only for the seconds a Facebook upload takes, purely so
+    a second reviewer's tap cannot start the same upload twice. If the app dies
+    inside that window the row would otherwise sit in a state nothing looks at,
+    silently costing that slot its post.
+    """
+    cur = conn.execute(
+        "UPDATE post_queue SET status = 'pending' WHERE status = 'publishing'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def release_all_in_review(conn):
+    """Put every claimed-but-undecided question back in the pool.
+
+    Which question a reviewer is currently looking at is only ever held in
+    memory, so after a restart nothing knows about an in_review row and it would
+    sit there unreviewable forever. Called once at startup.
+    """
+    cur = conn.execute(
+        "UPDATE questions SET status = 'pending_review', claimed_by = NULL WHERE status = 'in_review'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def release_question(conn, question_id):
     """Skip: release a claimed row back to pending_review so any admin can claim it again."""
     conn.execute(
@@ -201,13 +242,39 @@ def set_question_status(conn, question_id, status, reject_reason=None):
     conn.commit()
 
 
-def get_approved_questions(conn, lang, limit):
-    rows = conn.execute(
-        "SELECT * FROM questions WHERE status = 'approved' AND lang = ? "
-        "ORDER BY id LIMIT ?",
-        (lang, limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def claim_next_approved_question(conn):
+    """Take the oldest approved question and mark it 'queued' in one step.
+
+    The mark is the whole point: slots for the day are built in a single pass,
+    so without it every slot would look up "oldest approved" and get the same
+    row back. Returns None when nothing is approved yet.
+    """
+    row = conn.execute(
+        "SELECT * FROM questions WHERE status = 'approved' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE questions SET status = 'queued' WHERE id = ?", (row["id"],))
+    conn.commit()
+    question = dict(row)
+    question["status"] = "queued"
+    return question
+
+
+def count_questions_by_status(conn):
+    rows = conn.execute("SELECT status, COUNT(*) AS n FROM questions GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
+
+
+def unqueue_questions(conn, question_ids, status):
+    """Send queued questions back out of the queue — 'approved' to try again
+    later, 'rejected' to retire them."""
+    for qid in question_ids:
+        conn.execute(
+            "UPDATE questions SET status = ? WHERE id = ? AND status = 'queued'",
+            (status, qid),
+        )
+    conn.commit()
 
 
 def mark_questions_posted(conn, question_ids, fb_feed_post_id=None, fb_story_id=None):
@@ -246,29 +313,71 @@ def get_questions_by_ids(conn, question_ids):
 
 # ---- post_queue -----------------------------------------------------------
 
-def enqueue_post(conn, kind, lang, question_ids, scheduled_at):
-    conn.execute(
-        "INSERT INTO post_queue (kind, lang, question_ids, scheduled_at) VALUES (?, ?, ?, ?)",
-        (kind, lang, json.dumps(question_ids), scheduled_at),
+def enqueue_post(conn, kind, lang, question_ids, scheduled_at, parent_id=None):
+    cur = conn.execute(
+        "INSERT INTO post_queue (kind, lang, question_ids, scheduled_at, parent_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (kind, lang, json.dumps(question_ids), scheduled_at, parent_id),
     )
     conn.commit()
+    return cur.lastrowid
 
 
-def queue_entry_exists(conn, kind, lang, scheduled_at):
+def queue_slot_filled(conn, kind, scheduled_at):
+    """Is this time slot still occupied by a post that might yet go out?
+
+    Rejected and cancelled entries deliberately do NOT count as filling the
+    slot. That is what makes a rejection self-healing: the slot reads as empty
+    again, so the scheduler's next pass drops a fresh question into it and the
+    day still reaches its full number of posts.
+    """
     row = conn.execute(
-        "SELECT 1 FROM post_queue WHERE kind = ? AND lang = ? AND scheduled_at = ?",
-        (kind, lang, scheduled_at),
+        "SELECT 1 FROM post_queue WHERE kind = ? AND scheduled_at = ? "
+        "AND status NOT IN ('rejected', 'cancelled', 'skipped')",
+        (kind, scheduled_at),
     ).fetchone()
     return row is not None
 
 
-def get_due_queue_entries(conn, now_iso):
+def get_due_queue_entries(conn, now_iso, kind):
     rows = conn.execute(
-        "SELECT * FROM post_queue WHERE status = 'pending' AND scheduled_at <= ? "
+        "SELECT * FROM post_queue WHERE status = 'pending' AND kind = ? AND scheduled_at <= ? "
         "ORDER BY scheduled_at",
+        (kind, now_iso),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_due_answer_stories(conn, now_iso):
+    """Answer stories that are due AND whose post actually made it to Facebook.
+
+    The parent join is what makes rejecting a post also cancel its answer —
+    without it, rejecting the question still leaves its answer story armed and
+    it would publish an answer to a post nobody ever saw.
+    """
+    rows = conn.execute(
+        "SELECT q.* FROM post_queue q "
+        "JOIN post_queue parent ON parent.id = q.parent_id "
+        "WHERE q.status = 'pending' AND q.kind = 'story_a' AND q.scheduled_at <= ? "
+        "AND parent.status = 'done' "
+        "ORDER BY q.scheduled_at",
         (now_iso,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def cancel_child_entries(conn, parent_id, reason):
+    conn.execute(
+        "UPDATE post_queue SET status = 'cancelled', last_error = ? "
+        "WHERE parent_id = ? AND status = 'pending'",
+        (reason, parent_id),
+    )
+    conn.commit()
+
+
+def count_queue_by_status(conn):
+    rows = conn.execute("SELECT status, COUNT(*) AS n FROM post_queue GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
 
 
 def get_awaiting_approval_entries(conn):

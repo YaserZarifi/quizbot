@@ -1,17 +1,22 @@
 """Facebook Graph API calls — uploading rendered cards and posting them.
 See kankor_quiz_bot_spec.md §8.4.
 
-Every post_queue entry now needs an admin's explicit Approve tap in Telegram
-before this module is ever called (see main.py / review_bot.py) — so by the
-time these functions run, "now" already is the right moment to publish.
-That's why feed posts publish immediately rather than using Facebook's
-scheduled_publish_time: a post approved minutes or hours after its original
-slot would otherwise fail Facebook's "must be >=10 minutes in the future"
-scheduling rule.
+Two things reach Facebook, and they are gated differently:
 
-Every Graph API call is wrapped in try/except: on failure the post_queue row
-is bumped for retry and a short friendly line goes to console, full response
-detail goes to error.log — never a raw HTTP error on screen.
+  publish_post()          one question -> a feed post AND a question story.
+                          Only ever called after an admin taps Publish in
+                          Telegram, so "now" is always the right moment to post
+                          (which is why nothing uses Facebook's scheduled
+                          publishing — a post approved an hour after its slot
+                          would fail the "must be >=10 minutes ahead" rule).
+
+  publish_answer_story()  the answer reveal, 6 hours later. No approval — the
+                          scheduler only calls it once the parent post reached
+                          'done', so approving the question approves its answer.
+
+Every Graph API call is wrapped: on failure the post_queue row goes back to
+pending for a later retry and a short, plain line goes to the console, while
+the full HTTP detail goes to error.log — never a raw error on screen.
 """
 
 import json
@@ -79,98 +84,97 @@ def _create_photo_story(photo_id, cfg):
     return body.get("post_id") or body.get("id")
 
 
-def _themes_and_strings(cfg):
+def themes_and_strings(cfg):
     themes = render.load_themes(cfg["paths"]["themes_file"])
     strings = render.load_strings(cfg["paths"]["strings_file"])
     return themes, strings
 
 
-def _theme_for(question, themes):
+def theme_for(question, themes):
+    """Colour palette only. The subject is never shown to readers (see
+    render.py) — a mis-tagged question just gets a different colour."""
     return themes.get(question["subject"], themes["عمومی"])
 
 
-async def publish_feed(conn, cfg, entry):
-    """entry.kind == 'feed': render each question's card, upload as unpublished
-    photos, then create one multi-photo Page post with the standard caption
-    + hashtags, published immediately (admin approval already gated the timing)."""
+def _first_question(conn, entry, what):
+    """Every queue entry now carries exactly one question."""
     question_ids = json.loads(entry["question_ids"])
     questions = db.get_questions_by_ids(conn, question_ids)
     if not questions:
-        db.set_queue_status(conn, entry["id"], "failed", "no matching questions in database", bump_attempts=True)
-        logger.error(COMPONENT, f"feed post #{entry['id']} skipped — no matching questions in database")
+        db.set_queue_status(conn, entry["id"], "failed", "question missing from database", bump_attempts=True)
+        logger.error(
+            COMPONENT,
+            f"could not post the {what} — its question is no longer in the database",
+            next_step="this post has been dropped; the schedule continues normally",
+        )
+        return None, None
+    return questions[0], question_ids
+
+
+async def publish_post(conn, cfg, entry):
+    """Publish one approved question: a feed post, then its question story."""
+    question, question_ids = _first_question(conn, entry, "post")
+    if question is None:
         return False
 
-    themes, strings = _themes_and_strings(cfg)
-    try:
-        photo_ids = []
-        for q in questions:
-            png_path = await render.render_feed_card(q, _theme_for(q, themes), strings, cfg)
-            photo_ids.append(_upload_unpublished_photo(png_path, cfg))
+    themes, strings = themes_and_strings(cfg)
+    theme = theme_for(question, themes)
+    public_id = question["public_id"]
 
+    try:
+        logger.info(COMPONENT, f"posting question {public_id} to Facebook...")
+
+        png_path = await render.render_feed_card(question, theme, strings, cfg)
+        photo_id = _upload_unpublished_photo(png_path, cfg)
         caption = build_feed_caption(entry["lang"], strings, cfg)
-        post_id = _create_feed_post(photo_ids, caption, cfg)
+        post_id = _create_feed_post([photo_id], caption, cfg)
+        logger.detail(COMPONENT, "feed post published")
 
-        db.mark_questions_posted(conn, question_ids, fb_feed_post_id=post_id)
+        story_png = await render.render_story_question(question, theme, strings, cfg)
+        story_photo_id = _upload_unpublished_photo(story_png, cfg)
+        story_id = _create_photo_story(story_photo_id, cfg)
+        logger.detail(COMPONENT, "question story published")
+
+        db.mark_questions_posted(conn, question_ids, fb_feed_post_id=post_id, fb_story_id=story_id)
         db.set_queue_status(conn, entry["id"], "done")
-        logger.ok(COMPONENT, f"feed post published for {entry['lang']} — {len(questions)} questions")
+        logger.ok(COMPONENT, f"question {public_id} is live on Facebook — answer story follows in 6 hours")
         return True
     except Exception as exc:
         db.set_queue_status(conn, entry["id"], "pending", str(exc), bump_attempts=True)
-        logger.error(COMPONENT, "Facebook rejected the feed post — see error.log for details", exc)
+        logger.error(
+            COMPONENT,
+            f"Facebook would not accept question {public_id}",
+            exc,
+            next_step="it stays in the queue and will be offered for approval again shortly",
+        )
         return False
 
 
-async def publish_story_question(conn, cfg, entry):
-    """entry.kind == 'story_q': one Story per question, posted right now
-    (no server-side scheduling exists for stories)."""
-    question_ids = json.loads(entry["question_ids"])
-    questions = db.get_questions_by_ids(conn, question_ids)
-    if not questions:
-        db.set_queue_status(conn, entry["id"], "failed", "no matching questions in database", bump_attempts=True)
-        logger.error(COMPONENT, f"question story #{entry['id']} skipped — no matching questions in database")
+async def publish_answer_story(conn, cfg, entry):
+    """The answer reveal, posted automatically 6 hours after its question."""
+    question, question_ids = _first_question(conn, entry, "answer story")
+    if question is None:
         return False
 
-    themes, strings = _themes_and_strings(cfg)
+    themes, strings = themes_and_strings(cfg)
+    public_id = question["public_id"]
+
     try:
-        story_id = None
-        for q in questions:
-            png_path = await render.render_story_question(q, _theme_for(q, themes), strings, cfg)
-            photo_id = _upload_unpublished_photo(png_path, cfg)
-            story_id = _create_photo_story(photo_id, cfg)
-
-        db.mark_questions_posted(conn, question_ids, fb_story_id=story_id)
-        db.set_queue_status(conn, entry["id"], "done")
-        logger.ok(COMPONENT, f"question story posted for {entry['lang']} — {len(questions)} questions")
-        return True
-    except Exception as exc:
-        db.set_queue_status(conn, entry["id"], "pending", str(exc), bump_attempts=True)
-        logger.error(COMPONENT, "Facebook rejected the question story — see error.log for details", exc)
-        return False
-
-
-async def publish_story_answer(conn, cfg, entry):
-    """entry.kind == 'story_a': the answer-reveal Story, posted answer_delay_hours
-    after the question story, matched by question id."""
-    question_ids = json.loads(entry["question_ids"])
-    questions = db.get_questions_by_ids(conn, question_ids)
-    if not questions:
-        db.set_queue_status(conn, entry["id"], "failed", "no matching questions in database", bump_attempts=True)
-        logger.error(COMPONENT, f"answer story #{entry['id']} skipped — no matching questions in database")
-        return False
-
-    themes, strings = _themes_and_strings(cfg)
-    try:
-        story_id = None
-        for q in questions:
-            png_path = await render.render_story_answer(q, _theme_for(q, themes), strings, cfg)
-            photo_id = _upload_unpublished_photo(png_path, cfg)
-            story_id = _create_photo_story(photo_id, cfg)
+        logger.info(COMPONENT, f"posting the answer story for question {public_id}...")
+        png_path = await render.render_story_answer(question, theme_for(question, themes), strings, cfg)
+        photo_id = _upload_unpublished_photo(png_path, cfg)
+        story_id = _create_photo_story(photo_id, cfg)
 
         db.mark_answers_posted(conn, question_ids, fb_answer_story_id=story_id)
         db.set_queue_status(conn, entry["id"], "done")
-        logger.ok(COMPONENT, f"answer story posted for {entry['lang']} — {len(questions)} questions")
+        logger.ok(COMPONENT, f"answer story for question {public_id} is live — this question is now complete")
         return True
     except Exception as exc:
         db.set_queue_status(conn, entry["id"], "pending", str(exc), bump_attempts=True)
-        logger.error(COMPONENT, "Facebook rejected the answer story — see error.log for details", exc)
+        logger.error(
+            COMPONENT,
+            f"Facebook would not accept the answer story for question {public_id}",
+            exc,
+            next_step="the app will try again automatically in a few minutes",
+        )
         return False

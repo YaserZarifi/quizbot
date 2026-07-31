@@ -1,8 +1,11 @@
-"""Telegram scraper (Telethon userbot). Pulls quiz polls from configured
-sources into the local database — see kankor_quiz_bot_spec.md §8.1.
+"""Telegram scraper (Telethon userbot). Pulls quiz polls from the configured
+channels into the local database — see kankor_quiz_bot_spec.md §8.1.
 
-First run per source does a full history backfill (resumable); later runs
-only fetch messages newer than the stored last_seen_message_id.
+Runs continuously as one of main.py's background tasks. The first pass over a
+channel walks its entire history, which for a large channel is hours of work;
+it checkpoints every 100 messages so switching the app off and on again resumes
+where it stopped rather than starting over. Once a channel's history is fully
+read, later passes only fetch messages newer than the last one seen.
 """
 
 import asyncio
@@ -10,14 +13,11 @@ import logging as _logging
 import os
 import random
 import re
-import sys
 
-import yaml
 from telethon import TelegramClient
 from telethon.tl.functions.messages import SendVoteRequest
 from telethon.tl.types import MessageMediaPhoto, MessageMediaPoll
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db
 import logger
 import subject_tagger
@@ -26,16 +26,12 @@ import text_clean
 COMPONENT = "ingest"
 SET_POSITION_RE = re.compile(r"\[?(\d{1,3})\s*/\s*(\d{1,3})\]?")
 BACKFILL_CHECKPOINT_EVERY = 100
+IDLE_SECONDS = 15 * 60
 
 # Telethon auto-retries transient server errors (RpcMcgetFailError etc.)
 # internally and logs a WARNING while doing so — harmless, but it's a raw
 # library log line, not our structured format, so keep it off the console.
 _logging.getLogger("telethon").setLevel(_logging.ERROR)
-
-
-def load_config(path="config.yaml"):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def _plain_text(value):
@@ -99,7 +95,7 @@ def _is_paired_photo(prev_message, poll_message):
 
 async def handle_quiz_message(
     client, conn, entity, message, prev_message, handle, lang_default,
-    promo_phrases, flag_words, position_ranges, subject_keywords,
+    promo_phrases, flag_words, position_ranges, subject_keywords, images_dir,
 ):
     poll = message.media.poll
     options_text = [_plain_text(a.text) for a in poll.answers][:4]
@@ -113,8 +109,8 @@ async def handle_quiz_message(
     image_path = None
     if _is_paired_photo(prev_message, message):
         question_type = "image"
-        os.makedirs("question_images", exist_ok=True)
-        image_path = os.path.join("question_images", f"{handle}_{message.id}.jpg")
+        os.makedirs(images_dir, exist_ok=True)
+        image_path = os.path.join(images_dir, f"{handle}_{message.id}.jpg")
         await prev_message.download_media(file=image_path)
 
     cleaned_text = text_clean.clean_question_text(raw_question_text, promo_phrases)
@@ -158,9 +154,10 @@ async def handle_quiz_message(
     return "saved", lexicon_flag
 
 
-async def process_source(client, conn, cfg, source_cfg):
+async def process_source(client, conn, cfg, source_cfg, stop_event):
     handle = source_cfg["handle"]
     lang_default = source_cfg.get("lang_default", "fa")
+    images_dir = cfg["paths"]["question_images_dir"]
 
     state = db.get_source_state(conn, handle)
     entity = await client.get_entity(handle)
@@ -171,11 +168,16 @@ async def process_source(client, conn, cfg, source_cfg):
     is_backfill = not state["backfill_complete"]
 
     if is_backfill and state["last_seen_message_id"] == 0:
-        logger.info(COMPONENT, f'starting full backfill of "{handle}"...')
+        logger.info(COMPONENT, f'reading the full history of "{handle}" for the first time')
+        logger.detail(COMPONENT, "this takes a while on a big channel, and picks up where it left off if you stop the app")
     elif is_backfill:
-        logger.info(COMPONENT, f'resuming full backfill of "{handle}"...')
+        logger.info(
+            COMPONENT,
+            f'continuing to read the history of "{handle}" '
+            f'({state["messages_scanned"]:,} messages read so far)',
+        )
     else:
-        logger.info(COMPONENT, f'checking "{handle}" for new messages...')
+        logger.info(COMPONENT, f'checking "{handle}" for new questions')
 
     promo_phrases = text_clean.load_promo_phrases(cfg["paths"]["promo_phrases_file"])
     flag_words = text_clean.load_lexicon_flag_words(cfg["paths"]["lexicon_file"])
@@ -199,7 +201,12 @@ async def process_source(client, conn, cfg, source_cfg):
 
     min_id = state["last_seen_message_id"]
 
+    interrupted = False
     async for message in client.iter_messages(entity, reverse=True, min_id=min_id):
+        if stop_event.is_set():
+            interrupted = True
+            break
+
         messages_scanned += 1
         last_id_seen = message.id
 
@@ -207,7 +214,7 @@ async def process_source(client, conn, cfg, source_cfg):
             try:
                 result, flagged = await handle_quiz_message(
                     client, conn, entity, message, prev_message, handle, lang_default,
-                    promo_phrases, flag_words, position_ranges, subject_keywords,
+                    promo_phrases, flag_words, position_ranges, subject_keywords, images_dir,
                 )
                 if result == "saved":
                     questions_saved += 1
@@ -216,7 +223,12 @@ async def process_source(client, conn, cfg, source_cfg):
                 elif result == "duplicate":
                     duplicates_skipped += 1
             except Exception as exc:
-                logger.error(COMPONENT, f'failed to process a quiz in "{handle}" — see error.log', exc)
+                logger.error(
+                    COMPONENT,
+                    f'could not read one question from "{handle}" — skipping just that one',
+                    exc,
+                    next_step="reading continues normally with the next message",
+                )
 
         prev_message = message
 
@@ -227,58 +239,100 @@ async def process_source(client, conn, cfg, source_cfg):
                 messages_scanned=state["messages_scanned"] + messages_scanned,
                 questions_found=state["questions_found"] + questions_saved,
             )
+            done_total = state["messages_scanned"] + messages_scanned
             if approx_total:
-                logger.info(COMPONENT, f"  ...{messages_scanned:,} / ~{approx_total:,} messages scanned so far")
+                pct = min(100, int(done_total * 100 / max(approx_total, 1)))
+                logger.detail(
+                    COMPONENT,
+                    f'"{handle}": {done_total:,} of about {approx_total:,} messages read ({pct}%) '
+                    f"— {questions_saved:,} new questions found so far",
+                )
             else:
-                logger.info(COMPONENT, f"  ...{messages_scanned:,} messages scanned so far")
+                logger.detail(
+                    COMPONENT,
+                    f'"{handle}": {done_total:,} messages read — {questions_saved:,} new questions found so far',
+                )
 
     db.update_source_state(
         conn, handle,
         last_seen_message_id=last_id_seen,
-        backfill_complete=1,
+        backfill_complete=0 if interrupted else 1,
         messages_scanned=state["messages_scanned"] + messages_scanned,
         questions_found=state["questions_found"] + questions_saved,
     )
 
-    logger.summary(COMPONENT, f'finished "{handle}"', [
-        ("messages scanned", f"{messages_scanned:,}"),
-        ("questions saved", f"{questions_saved:,}"),
-        ("duplicates skipped", f"{duplicates_skipped:,}"),
-        ("flagged for review", f"{flagged_for_review:,}"),
-    ])
-    logger.blank()
-
-
-async def run_ingest(config_path="config.yaml"):
-    cfg = load_config(config_path)
-    os.environ.setdefault("KANKOR_LOG_DIR", cfg["paths"].get("log_dir", "logs"))
-    conn = db.connect(cfg["paths"]["db_file"])
-
-    tg_cfg = cfg["telegram"]
-    if not tg_cfg.get("api_id") or not tg_cfg.get("api_hash"):
-        logger.error(COMPONENT, "telegram.api_id / api_hash are not set in config.yaml")
+    if interrupted:
+        logger.info(COMPONENT, f'paused reading "{handle}" — it will resume from here next time')
         return
 
+    if messages_scanned == 0:
+        logger.detail(COMPONENT, f'"{handle}": nothing new since last check')
+        return
+
+    logger.summary(COMPONENT, f'finished reading "{handle}"', [
+        ("messages read", f"{messages_scanned:,}"),
+        ("new questions saved", f"{questions_saved:,}"),
+        ("already had these", f"{duplicates_skipped:,}"),
+        ("marked for a closer look", f"{flagged_for_review:,}"),
+    ])
+
+
+def _all_history_read(conn, cfg):
+    return all(
+        db.get_source_state(conn, s["handle"])["backfill_complete"]
+        for s in cfg["sources"]
+    )
+
+
+async def connect(cfg):
+    """Sign in to Telegram. The first run asks for a phone number and the login
+    code on the console; after that the saved session file logs in silently."""
+    tg_cfg = cfg["telegram"]
     client = TelegramClient(tg_cfg["session_name"], tg_cfg["api_id"], tg_cfg["api_hash"])
-    logger.setup(COMPONENT, "connecting to Telegram (first run may ask for phone + login code)...")
+    logger.setup(COMPONENT, "signing in to Telegram...")
     await client.start()
-    logger.ok(COMPONENT, "connected")
-    logger.blank()
-
-    for source_cfg in cfg["sources"]:
-        try:
-            await process_source(client, conn, cfg, source_cfg)
-        except Exception as exc:
-            logger.error(COMPONENT, f'failed to scrape "{source_cfg["handle"]}" — see error.log', exc)
-            logger.blank()
-
-    await client.disconnect()
-    conn.close()
+    me = await client.get_me()
+    who = me.username or me.phone or "your account"
+    logger.ok(COMPONENT, f"signed in to Telegram as {who}")
+    return client
 
 
-def main():
-    asyncio.run(run_ingest())
+async def run(conn, cfg, stop_event, client):
+    """Keep reading the channels for as long as the app is running.
 
+    While any channel still has unread history this loops back immediately and
+    keeps going. Once every channel is fully read it settles into a check every
+    15 minutes for newly posted questions.
+    """
+    handles = ", ".join(f'"{s["handle"]}"' for s in cfg["sources"])
+    logger.ok(COMPONENT, f"scraper running — watching {len(cfg['sources'])} channels: {handles}")
 
-if __name__ == "__main__":
-    main()
+    while not stop_event.is_set():
+        for source_cfg in cfg["sources"]:
+            if stop_event.is_set():
+                break
+            try:
+                await process_source(client, conn, cfg, source_cfg, stop_event)
+            except Exception as exc:
+                logger.error(
+                    COMPONENT,
+                    f'could not read the channel "{source_cfg["handle"]}"',
+                    exc,
+                    next_step="the app will try this channel again in 15 minutes; other channels are unaffected",
+                )
+
+        if stop_event.is_set():
+            break
+
+        if _all_history_read(conn, cfg):
+            counts = db.count_questions_by_status(conn)
+            logger.info(
+                COMPONENT,
+                f"all channel history has been read — {counts.get('pending_review', 0):,} questions "
+                "are waiting for your review",
+            )
+            logger.detail(COMPONENT, "checking again for new questions in 15 minutes")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=IDLE_SECONDS)
+            except asyncio.TimeoutError:
+                pass
