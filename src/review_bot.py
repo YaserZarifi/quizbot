@@ -116,26 +116,51 @@ def _is_admin(update, admin_user_ids):
     return True
 
 
+# Telegram's hard limits. Exceeding either makes the edit fail outright, which
+# used to leave live buttons on a question that had already been decided.
+_CAPTION_LIMIT = 1024
+_TEXT_LIMIT = 4096
+
+
+def _fit(original, verdict, limit):
+    """Keep original + verdict inside Telegram's limit, trimming the original."""
+    tail = f"\n\n{verdict}"
+    room = limit - len(tail)
+    if room < 0:
+        return verdict[:limit]
+    if len(original) <= room:
+        return original + tail
+    return original[: max(0, room - 1)] + "…" + tail
+
+
 async def _close_cards(bot, cards, verdict, caption_mode=True):
     """Strip the buttons from every reviewer's copy and record the outcome.
 
-    Best-effort by design: a copy that cannot be edited (reviewer deleted the
-    chat, message too old) must not stop the others being cleared, and must not
-    fail the decision that has already been recorded in the database.
+    Removing the keyboard is done as its own call, before the text edit. The two
+    used to be one call, so whenever the combined text broke a Telegram limit
+    the whole edit failed and the buttons survived on a question that was
+    already decided — letting it be decided again and again.
+
+    Best-effort per copy: one unreachable chat must not stop the others being
+    cleared, and must never fail a decision already recorded in the database.
     """
     for chat_id, message_id, original in cards:
         try:
-            text = f"{original}\n\n{verdict}"
-            if caption_mode:
-                await bot.edit_message_caption(
-                    chat_id=chat_id, message_id=message_id, caption=text, reply_markup=None
-                )
-            else:
-                await bot.edit_message_text(
-                    chat_id=chat_id, message_id=message_id, text=text, reply_markup=None
-                )
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=None
+            )
         except Exception:
-            pass  # a stale copy is cosmetic; the decision itself already stands
+            pass
+
+        try:
+            limit = _CAPTION_LIMIT if caption_mode else _TEXT_LIMIT
+            text = _fit(original, verdict, limit)
+            if caption_mode:
+                await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text)
+            else:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        except Exception:
+            pass  # the outcome text is cosmetic; the buttons are already gone
 
 
 # ---- question review ------------------------------------------------------
@@ -286,18 +311,27 @@ async def _post_immediately(conn, cfg, qid, who):
     return f"⚠️ Facebook would not accept it. Approved instead — it will go out on the schedule."
 
 
-async def _decide_question(bot, conn, cfg, verdict):
-    """Close the open question for everyone, then offer the next one.
+def _clear_stale_review(conn):
+    """Drop the open question if the database says it is no longer open.
 
-    The open question is cleared before any Telegram call, so a second
-    reviewer's tap arriving mid-edit sees nothing open and is turned away
-    instead of decided twice.
+    Which question is in front of the reviewers is tracked in memory, and the
+    database is the truth. If a button handler ever fails partway through — it
+    has happened — the two disagree: the question is decided in the database but
+    memory still thinks it is open, so no new question is ever sent and every
+    further tap is turned away as "already decided". This notices that and
+    releases the jam instead of needing the app restarted.
     """
-    cards = _review["cards"]
+    qid = _review["qid"]
+    if qid is None:
+        return False
+    row = conn.execute("SELECT status FROM questions WHERE id = ?", (qid,)).fetchone()
+    if row is not None and row["status"] == "in_review":
+        return False  # genuinely still open, waiting on a reviewer
+
+    logger.warn(COMPONENT, "the question on screen had already been decided — moving on to the next one")
     _review["qid"] = None
     _review["cards"] = []
-    await _close_cards(bot, cards, verdict)
-    await _broadcast_next_question(bot, conn, cfg)
+    return True
 
 
 async def cmd_start(update, context):
@@ -364,48 +398,48 @@ async def on_button(update, context):
     if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
         return
     query = update.callback_query
+
+    # Acknowledge the tap before anything else. Telegram allows about fifteen
+    # seconds to answer a callback and then shows the button as failed, so this
+    # must never sit behind a lock that a slow Facebook upload might be holding.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     action, qid_str = query.data.split(":")
     qid = int(qid_str)
     conn = context.bot_data["conn"]
     who = update.effective_user.first_name or str(update.effective_user.id)
 
+    # Clear the buttons on the tapped copy immediately, so it cannot be pressed
+    # a second time while the decision is being carried out.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # The lock covers only the quick database work that settles who won the
+    # race. Telegram edits and Facebook uploads run outside it — holding it
+    # across those starved the loop that hands out the next question.
     async with _decision_lock:
         if _review["qid"] != qid:
-            # Someone else already decided this one and the buttons on this copy
-            # were a fraction too slow to disappear.
-            await query.answer("Already decided by another reviewer", show_alert=False)
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            return
+            return  # someone else already decided this one
 
-        await query.answer()
+        cards = _review["cards"]
+        _review["qid"] = None
+        _review["cards"] = []
 
         if action == "approve":
             db.set_question_status(conn, qid, "approved")
+            verdict = f"✅ Approved by {who}"
             logger.ok(COMPONENT, f"{who} approved a question — it will be scheduled for posting")
             scheduler.refill_now.set()
-            await _decide_question(context.bot, conn, cfg, f"✅ Approved by {who}")
 
         elif action == "skip":
             db.release_question(conn, qid)
+            verdict = f"⏭ Skipped by {who} (back in the queue)"
             logger.info(COMPONENT, f"{who} skipped a question — it goes back in the queue")
-            await _decide_question(context.bot, conn, cfg, f"⏭ Skipped by {who} (back in the queue)")
-
-        elif action == "postnow":
-            # Clear the buttons everywhere BEFORE the upload starts. Publishing
-            # takes several seconds, and leaving live buttons on every other
-            # reviewer's copy for that long invites a second tap on a question
-            # that is already on its way to Facebook.
-            cards = _review["cards"]
-            _review["qid"] = None
-            _review["cards"] = []
-            await _close_cards(context.bot, cards, f"🚀 Posting now, requested by {who}...")
-
-            verdict = await _post_immediately(conn, cfg, qid, who)
-            await _close_cards(context.bot, cards, verdict)
-            await _broadcast_next_question(context.bot, conn, cfg)
 
         elif action == "reject":
             # Recorded straight away. Waiting for a typed reason would hold up
@@ -413,11 +447,23 @@ async def on_button(update, context):
             db.set_question_status(conn, qid, "rejected")
             _pending_reason["qid"] = qid
             _pending_reason["admin_id"] = update.effective_user.id
+            verdict = f"❌ Rejected by {who}\n(optional: reply with a reason)"
             logger.info(COMPONENT, f"{who} rejected a question")
-            await _decide_question(
-                context.bot, conn, cfg, qid,
-                f"❌ Rejected by {who}\n(optional: reply with a reason)", who,
-            )
+
+        elif action == "postnow":
+            verdict = f"🚀 Posting now, requested by {who}..."
+
+        else:
+            return
+
+    await _close_cards(context.bot, cards, verdict)
+
+    if action == "postnow":
+        result = await _post_immediately(conn, cfg, qid, who)
+        await _close_cards(context.bot, cards, result)
+
+    async with _decision_lock:
+        await _broadcast_next_question(context.bot, conn, cfg)
 
 
 async def cmd_noreason(update, context):
@@ -523,57 +569,69 @@ async def on_post_button(update, context):
     if not _is_admin(update, cfg["telegram"]["admin_user_ids"]):
         return
     query = update.callback_query
+
+    # Answered first, and the tapped copy's buttons cleared first — same reason
+    # as the question buttons: publishing takes far longer than Telegram is
+    # willing to wait for a callback to be acknowledged.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     action, entry_id_str = query.data.split(":")
     entry_id = int(entry_id_str)
     conn = context.bot_data["conn"]
     who = update.effective_user.first_name or str(update.effective_user.id)
 
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # Lock held only long enough to claim the entry, so the loser of a race is
+    # turned away before either upload starts.
     async with _decision_lock:
         entry = db.get_queue_entry(conn, entry_id)
         if entry is None or entry["status"] != "awaiting_approval":
-            await query.answer("Already handled by another reviewer", show_alert=False)
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            return
-
-        await query.answer()
+            return  # already handled by whoever got here first
 
         cards = _post_cards.pop(entry_id, [])
         _sent_for_approval.discard(entry_id)
         question_ids = json.loads(entry["question_ids"])
         scheduled_hhmm = entry["scheduled_at"][11:16]
+        entry = dict(entry)
 
         if action == "post_approve":
-            # Claim it before the slow Facebook calls so a second reviewer's tap
-            # cannot start a duplicate publish while this one is in flight.
+            # Claimed before the slow Facebook calls so a second tap cannot
+            # start a duplicate publish while this one is in flight.
             db.set_queue_status(conn, entry_id, "publishing")
-            await _close_cards(
-                context.bot, cards, f"⏳ Approved by {who} — publishing...", caption_mode=False
-            )
-            logger.info(COMPONENT, f"{who} approved the {scheduled_hhmm} post")
-
-            entry = dict(entry)
-            published = await publish.publish_post(conn, cfg, entry)
-            note = (
-                "✅ Published. The answer story posts automatically in 6 hours."
-                if published
-                else "⚠️ Facebook would not accept it. The app will offer it again shortly."
-            )
-            await _close_cards(context.bot, cards, f"{'✅' if published else '⚠️'} {note}", caption_mode=False)
-
         elif action == "post_reject":
             db.set_queue_status(conn, entry_id, "rejected", "rejected by reviewer")
             db.cancel_child_entries(conn, entry_id, "its post was rejected")
             db.unqueue_questions(conn, question_ids, "rejected")
-            await _close_cards(
-                context.bot, cards,
-                f"❌ Rejected by {who} — finding a replacement question...", caption_mode=False,
-            )
-            logger.info(COMPONENT, f"{who} rejected the {scheduled_hhmm} post")
-            logger.detail(COMPONENT, "picking another approved question so the day still gets its full posts")
-            scheduler.refill_now.set()
+        else:
+            return
+
+    if action == "post_approve":
+        await _close_cards(context.bot, cards, f"⏳ Approved by {who} — publishing...", caption_mode=False)
+        logger.info(COMPONENT, f"{who} approved the {scheduled_hhmm} post")
+
+        published = await publish.publish_post(conn, cfg, entry)
+        note = (
+            "✅ Published. The answer story posts automatically in 6 hours."
+            if published
+            else "⚠️ Facebook would not accept it. The app will offer it again shortly."
+        )
+        await _close_cards(context.bot, cards, note, caption_mode=False)
+
+    else:
+        await _close_cards(
+            context.bot, cards,
+            f"❌ Rejected by {who} — finding a replacement question...", caption_mode=False,
+        )
+        logger.info(COMPONENT, f"{who} rejected the {scheduled_hhmm} post")
+        logger.detail(COMPONENT, "picking another approved question so the day still gets its full posts")
+        scheduler.refill_now.set()
 
 
 # ---- background push loops ------------------------------------------------
@@ -583,6 +641,7 @@ async def _push_questions_loop(app, conn, cfg, stop_event):
     while not stop_event.is_set():
         try:
             async with _decision_lock:
+                _clear_stale_review(conn)
                 await _broadcast_next_question(app.bot, conn, cfg)
         except Exception as exc:
             logger.error(
@@ -612,6 +671,25 @@ async def _push_posts_loop(app, conn, cfg, stop_event):
         await _sleep_or_stop(stop_event, PUSH_INTERVAL_SECONDS)
 
 
+async def on_telegram_error(update, context):
+    """Report anything that went wrong handling a Telegram update.
+
+    python-telegram-bot catches handler exceptions itself, so without this they
+    never reach the console and a broken button looks like a broken bot with no
+    explanation anywhere.
+    """
+    exc = context.error
+    if _looks_transient(exc):
+        logger.warn(COMPONENT, "the internet was slow talking to Telegram — retrying shortly")
+        return
+    logger.error(
+        COMPONENT,
+        "something went wrong handling a Telegram button or message",
+        exc,
+        next_step="the app keeps running and will offer the next question shortly",
+    )
+
+
 async def _sleep_or_stop(stop_event, seconds):
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
@@ -639,6 +717,9 @@ async def run(conn, cfg, stop_event):
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(approve|reject|skip|postnow):"))
     app.add_handler(CallbackQueryHandler(on_post_button, pattern=r"^post_(approve|reject):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # Without this, a crash inside a button handler is swallowed by the library
+    # and the app looks healthy while the buttons quietly stop working.
+    app.add_error_handler(on_telegram_error)
 
     await app.initialize()
     await app.start()
